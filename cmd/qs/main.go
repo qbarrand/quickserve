@@ -1,12 +1,17 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
 )
 
 var (
@@ -28,9 +33,12 @@ func main() {
 		return
 	}
 
-	sfs := make(map[string]bool, len(cfg.Paths))
+	filesystem, err := fsFromPaths(cfg.Paths...)
+	if err != nil {
+		log.Fatalf("Could not create a filesystem to serve: %v", err)
+	}
 
-	h := http.FileServer(subFS(sfs))
+	h := http.FileServer(http.FS(filesystem))
 
 	if err = http.ListenAndServe(cfg.Address, h); err != nil {
 		log.Fatalf("Error while running the server: %v", err)
@@ -47,38 +55,128 @@ func writeVersion(w io.Writer) error {
 	return err
 }
 
-//type Handler struct {
-//	logger *log.Logger
-//	sfs    subFS
-//}
-//
-//func NewHandler(logger *log.Logger, paths []string) *Handler {
-//	h := Handler{
-//		logger: logger,
-//		sfs:    make(map[string]bool, len(paths)),
-//	}
-//
-//	for _, p := range paths {
-//		h.sfs[p] = true
-//	}
-//
-//	return &h
-//}
-//
-//func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-//	http.FileServer()
-//}
+type aliasDirEntry struct {
+	de      fs.DirEntry
+	sysPath string
+}
 
-type subFS map[string]bool
+type dirFileInfo struct{}
 
-func (sfs subFS) Open(name string) (http.File, error) {
+func (dfi *dirFileInfo) Name() string       { return "/" }
+func (dfi *dirFileInfo) Size() int64        { return 0 }
+func (dfi *dirFileInfo) Mode() os.FileMode  { return os.ModeDir }
+func (dfi *dirFileInfo) ModTime() time.Time { return time.Now() }
+func (dfi *dirFileInfo) IsDir() bool        { return true }
+func (dfi *dirFileInfo) Sys() interface{}   { return nil }
 
-	fs.Sub()
-	log.Printf("Looking for %q", name)
+// rootFile implements both fs.FS and fs.ReadDirFile.
+type rootFile map[string]*aliasDirEntry
 
-	if !sfs[name] {
-		return nil, fs.ErrNotExist
+func (rf rootFile) Close() error { return nil }
+
+func (rf rootFile) Read(b []byte) (int, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (rf rootFile) Stat() (fs.FileInfo, error) {
+	return &dirFileInfo{}, nil
+}
+
+func (rf rootFile) Open(name string) (fs.File, error) {
+	log.Printf("open(%q)", name)
+
+	if name == "/" || name == "." {
+		return rf, nil
 	}
 
-	return os.Open(name)
+	if ade, ok := rf[name]; ok {
+		return os.Open(ade.sysPath)
+	}
+
+	elems := strings.SplitN(name, "/", 2)
+
+	// Check the first segment in name. Is it a directory name owned by sf?
+	if len(elems) == 2 {
+		dir := elems[0]
+
+		dirEntry, ok := rf[dir]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+
+		return os.DirFS(dirEntry.sysPath).Open(elems[1])
+	}
+
+	return nil, os.ErrNotExist
+}
+
+func (rf rootFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	if len(rf) < n {
+		n = len(rf)
+	}
+
+	entries := make([]fs.DirEntry, 0, n)
+
+	for _, ade := range rf {
+		// append up to n values
+		if len(entries) >= n {
+			break
+		}
+
+		entries = append(entries, ade.de)
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	return entries, nil
+}
+
+func (rf rootFile) addMapping(name, fullPath string) error {
+	if ade := rf[name]; ade != nil {
+		return fmt.Errorf("%s already maps to %s", name, ade.sysPath)
+	}
+
+	fi, err := os.Stat(fullPath)
+	if err != nil {
+		return fmt.Errorf("could not stat(%q): %v", fullPath, err)
+	}
+
+	rf[name] = &aliasDirEntry{
+		de:      fs.FileInfoToDirEntry(fi),
+		sysPath: fullPath,
+	}
+
+	return nil
+}
+
+func fsFromPaths(paths ...string) (fs.FS, error) {
+	if len(paths) <= 0 {
+		return nil, errors.New("at least one path is required")
+	}
+
+	sf := make(rootFile)
+
+	for _, path := range paths {
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("could not get the absolute path for %q: %v", path, err)
+		}
+
+		fi, err := os.Stat(absPath)
+		if err != nil {
+			return nil, fmt.Errorf("could not stat(%q): %v", absPath, err)
+		}
+
+		name := fi.Name()
+
+		log.Printf("Adding %s=%s", name, absPath)
+
+		if err := sf.addMapping(name, absPath); err != nil {
+			return nil, fmt.Errorf("could not add mapping %s=%s: %v", name, absPath, err)
+		}
+	}
+
+	return sf, nil
 }
