@@ -46,11 +46,11 @@ func main() {
 }
 
 func writeVersion(w io.Writer) error {
-	if _, err := fmt.Fprint(w, "Version: ", version); err != nil {
+	if _, err := fmt.Fprintln(w, "Version: ", version); err != nil {
 		return err
 	}
 
-	_, err := fmt.Fprint(w, "Commit: ", commit)
+	_, err := fmt.Fprintln(w, "Commit: ", commit)
 
 	return err
 }
