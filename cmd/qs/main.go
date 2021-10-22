@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/qbarrand/quickserve/pkg/middlewares"
 )
 
 var (
@@ -39,6 +41,10 @@ func main() {
 	}
 
 	h := http.FileServer(http.FS(filesystem))
+
+	if !cfg.AllowDotFiles {
+		h = middlewares.HideDotFiles(http.StatusForbidden, h)
+	}
 
 	if err = http.ListenAndServe(cfg.Address, h); err != nil {
 		log.Fatalf("Error while running the server: %v", err)
@@ -111,7 +117,7 @@ func (rf rootFile) Open(name string) (fs.File, error) {
 }
 
 func (rf rootFile) ReadDir(n int) ([]fs.DirEntry, error) {
-	if len(rf) < n {
+	if n <= 0 || len(rf) < n {
 		n = len(rf)
 	}
 
